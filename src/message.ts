@@ -129,7 +129,7 @@ function scheduleNextPull(delay: number): void {
 export function startPullLoop(): void {
     consecutiveFailureCount = 0;
     scheduleNextPull(0);
-    logger.info('京东消息任务启动');
+    logger.info('消息任务启动');
 }
 
 export async function callApi({ url, params }: { url: string; params?: Record<string, any> }): Promise<any> {
