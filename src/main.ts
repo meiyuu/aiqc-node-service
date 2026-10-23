@@ -23,7 +23,8 @@ app.all('/message/callApi', async (request, reply) => {
         return { code: 200, data };
     } catch (error: any) {
         reply.status(500);
-        return { code: 500, message: error?.message };
+        logger.error(JSON.stringify({ desc: 'callApi--失败', url, params: params?.params, error: error?.message || '接口调用异常' }));
+        return { code: 500, message: error?.message || '接口调用异常' };
     }
 });
 

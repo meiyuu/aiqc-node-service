@@ -1,5 +1,4 @@
-FROM --platform=linux/amd64 node:22.19.0-bookworm-slim
-
+FROM --platform=linux/amd64 node:22.23.4-bookworm-slim
 WORKDIR /data/srv/
 
 ENV TZ Asia/Shanghai

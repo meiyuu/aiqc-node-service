@@ -2,8 +2,15 @@ import axios from 'axios';
 import * as crypto from 'crypto';
 import { logger } from './logger';
 
-const JCQ_PULL_INTERVAL = Number(process.env.JD_JCQ_PULL_INTERVAL_MS || 3000);
+const JCQ_PULL_INTERVAL = Number(process.env.JD_JCQ_PULL_INTERVAL_MS || 1000);
+const JCQ_PULL_SIZE = Number(process.env.JD_JCQ_PULL_SIZE || 20);
+const JCQ_PULL_TIMEOUT = Number(process.env.JD_JCQ_PULL_TIMEOUT_MS || 30000);
+const JCQ_ACK_TIMEOUT = Number(process.env.JD_JCQ_ACK_TIMEOUT_MS || 10000);
+const JCQ_FORWARD_TIMEOUT = Number(process.env.JD_JCQ_FORWARD_TIMEOUT_MS || 30000);
+const MAX_RETRY_INTERVAL = 30000;
 const MAX_CONSECUTIVE_FAILURES = 50;
+
+type JcqAckAction = 'SUCCESS' | 'CONSUME_FAILED' | 'RESEND' | 'DISCARD';
 
 let isPulling = false;
 let consecutiveFailureCount = 0;
@@ -24,11 +31,12 @@ function getJcqSignature(signParams: Record<string, string | number>, secretKey:
 async function ackJcqMessage(
     config: { url: string; accessKey: string; secretKey: string; topic: string; consumerGroupId: string },
     ackIndex: string,
+    ackAction: JcqAckAction = 'SUCCESS',
 ): Promise<void> {
     const ackBody = {
         topic: config.topic,
         consumerGroupId: config.consumerGroupId,
-        ackAction: 'SUCCESS',
+        ackAction,
         ackIndex,
     };
     const ackDateTime = getIsoDateTime();
@@ -43,22 +51,28 @@ async function ackJcqMessage(
     };
     const ackUrl = `${config.url}/v2/ack`;
     logger.info(JSON.stringify({ desc: 'pullJcqMessages--ACK参数', content: { ackUrl, ackBody } }));
-    const resp = await axios.post(ackUrl, ackBody, { headers: ackHeaders, timeout: 300000 });
+    const resp = await axios.post(ackUrl, ackBody, { headers: ackHeaders, timeout: JCQ_ACK_TIMEOUT });
+    if (resp.data?.error != null) {
+        logger.error(JSON.stringify({ desc: 'JCQ ACK业务失败', ackIndex, ackAction, content: resp.data }));
+        throw new Error(`JCQ ACK业务失败: ${JSON.stringify(resp.data)}`);
+    }
     logger.info(JSON.stringify({ desc: 'pullJcqMessages--ACK结果', content: resp.data }));
 }
 
-export async function pullJcqMessages(): Promise<void> {
+export async function pullJcqMessages(): Promise<number> {
+    const startedAt = Date.now();
     const config = {
         url: process.env.JD_JCQ_URL!,
         accessKey: process.env.JD_JCQ_KEY!,
         secretKey: process.env.JD_JCQ_SECRET!,
         topic: process.env.JD_JCQ_TOPIC!,
         consumerGroupId: process.env.JD_JCQ_CONSUMER_GROUP_ID!,
-        size: 1,
+        size: JCQ_PULL_SIZE,
         ack: 'false',
     };
 
-    if (!config.accessKey || !config.secretKey || !config.topic || !config.consumerGroupId) {
+    if (!config.url || !config.accessKey || !config.secretKey || !config.topic || !config.consumerGroupId) {
+        logger.error('JCQ配置缺失，请检查');
         throw new Error('JCQ配置缺失，请检查');
     }
 
@@ -78,36 +92,75 @@ export async function pullJcqMessages(): Promise<void> {
     };
     const pullUrl = `${config.url}/v2/messages?topic=${encodeURIComponent(config.topic)}&consumerGroupId=${encodeURIComponent(config.consumerGroupId)}&size=${config.size}&ack=${config.ack}`;
 
-    const pullResp = await axios.get(pullUrl, { headers: pullHeaders, timeout: 300000 });
+    const pullResp = await axios.get(pullUrl, { headers: pullHeaders, timeout: JCQ_PULL_TIMEOUT });
     const pullResult = pullResp.data;
-    const ackIndex = pullResult?.result?.ackIndex ? String(pullResult.result.ackIndex) : null;
-
-    if (ackIndex) {
-        logger.info(JSON.stringify({ desc: 'pullJcqMessages--拉取结果', content: pullResult }));
-        void ackJcqMessage(config, ackIndex);
+    if (pullResult?.error != null) {
+        logger.error(JSON.stringify({ desc: 'JCQ拉取业务失败', content: pullResult }));
+        throw new Error(`JCQ拉取业务失败: ${JSON.stringify(pullResult)}`);
     }
+    const messages = pullResult?.result?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) return 0;
 
-    if (pullResult?.result?.messages?.length > 0) {
+    const rawAckIndex = pullResult.result.ackIndex;
+    if ((typeof rawAckIndex !== 'string' && typeof rawAckIndex !== 'number') || String(rawAckIndex).length === 0) {
+        logger.error(JSON.stringify({ desc: 'JCQ拉取到消息但缺少有效的 ackIndex', content: pullResult }));
+        throw new Error('JCQ拉取到消息但缺少有效的 ackIndex');
+    }
+    const ackIndex = String(rawAckIndex);
+    logger.info(JSON.stringify({ desc: 'pullJcqMessages--拉取结果', messageCount: messages.length, ackIndex }));
+
+    let forwardResult: any;
+    try {
         const forwardResp = await axios.post('https://aiqc.aiyongtech.com/message/receiveJdMessage', {
-            messages: pullResult.result.messages,
-        });
-        logger.info(JSON.stringify({ desc: 'pullJcqMessages--结束', content: forwardResp.data }));
+            messages,
+        }, { timeout: JCQ_FORWARD_TIMEOUT });
+        forwardResult = forwardResp.data;
+        if (forwardResult?.code !== 200) {
+            logger.error(JSON.stringify({ desc: '消息转发业务失败', ackIndex, content: forwardResult }));
+            throw new Error(`消息转发业务失败: ${JSON.stringify(forwardResult)}`);
+        }
+    } catch (error) {
+        try {
+            await ackJcqMessage(config, ackIndex, 'CONSUME_FAILED');
+        } catch (ackError) {
+            logger.error(JSON.stringify({
+                desc: 'pullJcqMessages--消费失败ACK失败',
+                ackIndex,
+                error: (ackError as Error)?.message || ackError,
+            }));
+        }
+        throw error;
     }
+    await ackJcqMessage(config, ackIndex);
+    logger.info(JSON.stringify({
+        desc: 'pullJcqMessages--结束',
+        messageCount: messages.length,
+        durationMs: Date.now() - startedAt,
+        content: forwardResult,
+    }));
+    return messages.length;
 }
 
 async function executePull(): Promise<void> {
     if (isPulling) {
         logger.info('[pullJcqMessages] 上一次轮询尚未结束，跳过本次');
-        scheduleNextPull(JCQ_PULL_INTERVAL);
         return;
     }
     isPulling = true;
+    let nextDelay = JCQ_PULL_INTERVAL;
     try {
-        await pullJcqMessages();
+        const messageCount = await pullJcqMessages();
         consecutiveFailureCount = 0;
+        nextDelay = messageCount > 0 ? 0 : JCQ_PULL_INTERVAL;
     } catch (error) {
         consecutiveFailureCount++;
-        logger.error(JSON.stringify({ desc: 'pullJcqMessages--自动轮询执行失败', error: (error as Error)?.message || error }));
+        nextDelay = Math.min(MAX_RETRY_INTERVAL, JCQ_PULL_INTERVAL * 2 ** Math.min(consecutiveFailureCount - 1, 30));
+        logger.error(JSON.stringify({
+            desc: 'pullJcqMessages--自动轮询执行失败',
+            error: (error as Error)?.message || error,
+            consecutiveFailureCount,
+            nextDelay,
+        }));
         if (consecutiveFailureCount > MAX_CONSECUTIVE_FAILURES) {
             logger.error(JSON.stringify({
                 desc: 'pullJcqMessages--自动轮询连续失败次数超过阈值，请关注服务状态',
@@ -117,23 +170,30 @@ async function executePull(): Promise<void> {
         }
     } finally {
         isPulling = false;
-        scheduleNextPull(JCQ_PULL_INTERVAL);
+        scheduleNextPull(nextDelay);
     }
 }
 
 function scheduleNextPull(delay: number): void {
     if (pullTimer) clearTimeout(pullTimer);
-    pullTimer = setTimeout(() => void executePull(), Math.max(0, delay));
+    pullTimer = setTimeout(() => {
+        pullTimer = null;
+        void executePull();
+    }, Math.max(0, delay));
 }
 
 export function startPullLoop(): void {
+    if (pullTimer || isPulling) return;
     consecutiveFailureCount = 0;
     scheduleNextPull(0);
     logger.info('消息任务启动');
 }
 
 export async function callApi({ url, params }: { url: string; params?: Record<string, any> }): Promise<any> {
-    if (!url) throw new Error('缺少必填参数');
+    if (!url) {
+        logger.error('callApi缺少必填参数 url');
+        throw new Error('缺少必填参数');
+    }
     const resp = await axios.get(url, params);
     return resp.data;
 }
