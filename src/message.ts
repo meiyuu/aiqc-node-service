@@ -3,7 +3,7 @@ import * as crypto from 'crypto';
 import { logger } from './logger';
 
 const JCQ_PULL_INTERVAL = Number(process.env.JD_JCQ_PULL_INTERVAL_MS || 1000);
-const JCQ_PULL_SIZE = Number(process.env.JD_JCQ_PULL_SIZE || 20);
+const JCQ_PULL_SIZE = Number(process.env.JD_JCQ_PULL_SIZE || 32);
 const JCQ_PULL_TIMEOUT = Number(process.env.JD_JCQ_PULL_TIMEOUT_MS || 30000);
 const JCQ_ACK_TIMEOUT = Number(process.env.JD_JCQ_ACK_TIMEOUT_MS || 10000);
 const JCQ_FORWARD_TIMEOUT = Number(process.env.JD_JCQ_FORWARD_TIMEOUT_MS || 30000);
@@ -50,10 +50,9 @@ async function ackJcqMessage(
         ),
     };
     const ackUrl = `${config.url}/v2/ack`;
-    logger.info(JSON.stringify({ desc: 'pullJcqMessages--ACK参数', content: { ackUrl, ackBody } }));
     const resp = await axios.post(ackUrl, ackBody, { headers: ackHeaders, timeout: JCQ_ACK_TIMEOUT });
     if (resp.data?.error != null) {
-        logger.error(JSON.stringify({ desc: 'JCQ ACK业务失败', ackIndex, ackAction, content: resp.data }));
+        logger.error(JSON.stringify({ desc: 'pullJcqMessages--ACK失败', ackIndex, ackAction, content: resp.data }));
         throw new Error(`JCQ ACK业务失败: ${JSON.stringify(resp.data)}`);
     }
     logger.info(JSON.stringify({ desc: 'pullJcqMessages--ACK结果', content: resp.data }));
@@ -68,7 +67,7 @@ export async function pullJcqMessages(): Promise<number> {
         topic: process.env.JD_JCQ_TOPIC!,
         consumerGroupId: process.env.JD_JCQ_CONSUMER_GROUP_ID!,
         size: JCQ_PULL_SIZE,
-        ack: 'false',
+        ack: 'true',
     };
 
     if (!config.url || !config.accessKey || !config.secretKey || !config.topic || !config.consumerGroupId) {
@@ -104,10 +103,10 @@ export async function pullJcqMessages(): Promise<number> {
     const rawAckIndex = pullResult.result.ackIndex;
     if ((typeof rawAckIndex !== 'string' && typeof rawAckIndex !== 'number') || String(rawAckIndex).length === 0) {
         logger.error(JSON.stringify({ desc: 'JCQ拉取到消息但缺少有效的 ackIndex', content: pullResult }));
-        throw new Error('JCQ拉取到消息但缺少有效的 ackIndex');
     }
     const ackIndex = String(rawAckIndex);
-    logger.info(JSON.stringify({ desc: 'pullJcqMessages--拉取结果', messageCount: messages.length, ackIndex }));
+    const messageIds = messages.map((message) => message.messageId);
+    logger.info(JSON.stringify({ desc: 'pullJcqMessages--拉取结果', messageCount: messages.length, messageIds, ackIndex }));
 
     let forwardResult: any;
     try {
@@ -116,28 +115,24 @@ export async function pullJcqMessages(): Promise<number> {
         }, { timeout: JCQ_FORWARD_TIMEOUT });
         forwardResult = forwardResp.data;
         if (forwardResult?.code !== 200) {
-            logger.error(JSON.stringify({ desc: '消息转发业务失败', ackIndex, content: forwardResult }));
+            logger.error(JSON.stringify({ desc: '消息转发失败', ackIndex, content: forwardResult }));
             throw new Error(`消息转发业务失败: ${JSON.stringify(forwardResult)}`);
         }
     } catch (error) {
-        try {
-            await ackJcqMessage(config, ackIndex, 'CONSUME_FAILED');
-        } catch (ackError) {
-            logger.error(JSON.stringify({
-                desc: 'pullJcqMessages--消费失败ACK失败',
-                ackIndex,
-                error: (ackError as Error)?.message || ackError,
-            }));
-        }
-        throw error;
+        logger.error(JSON.stringify({ desc: '消息转发出错', ackIndex, error: (error as Error)?.message }));
+        // try {
+        //     await ackJcqMessage(config, ackIndex, 'CONSUME_FAILED');
+        // } catch (ackError) {
+        //     logger.error(JSON.stringify({
+        //         desc: 'pullJcqMessages--消费失败ACK失败',
+        //         ackIndex,
+        //         error: (ackError as Error)?.message || ackError,
+        //     }));
+        // }
+        // throw error;
     }
-    await ackJcqMessage(config, ackIndex);
-    logger.info(JSON.stringify({
-        desc: 'pullJcqMessages--结束',
-        messageCount: messages.length,
-        durationMs: Date.now() - startedAt,
-        content: forwardResult,
-    }));
+    // await ackJcqMessage(config, ackIndex);
+    logger.info(JSON.stringify({ desc: 'pullJcqMessages--结束', messageCount: messages.length, durationMs: Date.now() - startedAt }));
     return messages.length;
 }
 
